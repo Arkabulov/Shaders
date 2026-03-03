@@ -1,0 +1,150 @@
+/*
+ * VolumetricFog.azsl
+ * Volumetric atmospheric fog with screen-space god rays.
+ * Post-process pass for O3DE Atom renderer.
+ *
+ * DEPTH FORMAT: DepthPrePass.DepthLinear stores view-space Z in WORLD UNITS (meters).
+ *   - GetFarZ() returns actual far plane distance (e.g. 1000 m)
+ *   - Sky pixels have linearDepth ≈ GetFarZ()
+ *   - GetViewSpacePosition(uv, linearDepth) returns view-space position in meters
+ */
+
+#include <Atom/RPI/Math.azsli>
+#include <Atom/Features/PostProcessing/FullscreenVertex.azsli>
+#include <Atom/Features/PostProcessing/FullscreenPixelInfo.azsli>
+
+#include <scenesrg_all.srgi>
+#include <viewsrg_all.srgi>
+
+ShaderResourceGroup PassSrg : SRG_PerPass_WithFallback
+{
+    Texture2D<float4> m_inputColor;
+    Texture2D<float>  m_inputDepth;
+
+    // ---- Fog ----
+    float3 m_fogColor;
+    float  m_fogDensity;
+
+    float  m_fogHeightFalloff;
+    float  m_fogBaseHeight;
+    float  m_fogStartDistance;
+    float  m_fogEndDistance;
+
+    float  m_fogMaxOpacity;
+    int    m_enableFog;
+
+    // ---- God rays ----
+    float3 m_sunDirection;
+    float  m_godRayIntensity;
+
+    float3 m_sunColor;
+    float  m_godRayDecay;
+
+    float  m_godRayDensity;
+    float  m_godRayWeight;
+    int    m_godRaySamples;
+    float  m_godRayExposure;
+
+    int    m_enableGodRays;
+
+    Sampler m_sampler
+    {
+        MinFilter = Linear;
+        MagFilter = Linear;
+        MipFilter = Linear;
+        AddressU  = Clamp;
+        AddressV  = Clamp;
+        AddressW  = Clamp;
+    };
+};
+
+PSOutput MainPS(VSOutput IN)
+{
+    PSOutput OUT;
+
+    float2 uv          = IN.m_texCoord;
+    float4 sceneColor  = PassSrg::m_inputColor.Sample(PassSrg::m_sampler, uv);
+    float  linearDepth = PassSrg::m_inputDepth.Sample(PassSrg::m_sampler, uv).r;
+
+    float3 result = sceneColor.rgb;
+
+    // linearDepth = view-space Z in world units (meters).
+    // Sky pixels are at depth ≈ GetFarZ() (~1000 m).
+    float farZ  = ViewSrg::GetFarZ();
+    bool  isSky = (linearDepth >= farZ * 0.9999f);
+
+    // Reconstruct view-space position (meters) and get Euclidean camera distance.
+    float3 viewPos = ViewSrg::GetViewSpacePosition(uv, linearDepth);
+    float  dist    = length(viewPos);
+
+    // =========================================================
+    // Volumetric Fog  (pure distance-based, no height falloff)
+    // =========================================================
+    float fogFactor = 0.0f;
+
+    if (PassSrg::m_enableFog != 0 && !isSky)
+    {
+        float distRange = max(PassSrg::m_fogEndDistance - PassSrg::m_fogStartDistance, 1.0f);
+        float t         = saturate((dist - PassSrg::m_fogStartDistance) / distRange);
+
+        // Exponential-square: smooth onset, dense at far distances.
+        fogFactor = 1.0f - exp(-PassSrg::m_fogDensity * t * t * 4.0f);
+        fogFactor = min(fogFactor, PassSrg::m_fogMaxOpacity);
+
+        result = lerp(result, PassSrg::m_fogColor, fogFactor);
+    }
+
+    // =========================================================
+    // Screen-space God Rays / Light Shafts
+    // =========================================================
+    if (PassSrg::m_enableGodRays != 0)
+    {
+        float3 sunWorldPos = ViewSrg::m_worldPosition - PassSrg::m_sunDirection * 10000.0f;
+        float4 sunClip     = mul(ViewSrg::m_viewProjectionMatrix, float4(sunWorldPos, 1.0f));
+
+        float2 sunScreenUV;
+        if (sunClip.w > 0.001f)
+        {
+            sunScreenUV   = sunClip.xy / sunClip.w;
+            sunScreenUV   = sunScreenUV * 0.5f + 0.5f;
+            sunScreenUV.y = 1.0f - sunScreenUV.y;
+        }
+        else
+        {
+            sunScreenUV = float2(0.5f, 0.5f);
+        }
+
+        int    numSamples = clamp(PassSrg::m_godRaySamples, 4, 128);
+        float2 delta      = (uv - sunScreenUV) * (PassSrg::m_godRayDensity / float(numSamples));
+
+        float  illuminationDecay = 1.0f;
+        float3 godRayAccum       = float3(0.0f, 0.0f, 0.0f);
+        float2 sampleUV          = uv;
+
+        for (int i = 0; i < numSamples; ++i)
+        {
+            sampleUV -= delta;
+            sampleUV  = saturate(sampleUV);
+
+            // sampleDepth in world units; sky pixels are at depth ≈ farZ.
+            float sampleDepth = PassSrg::m_inputDepth.Sample(PassSrg::m_sampler, sampleUV).r;
+            float skyMask     = step(farZ * 0.9999f, sampleDepth);
+
+            float3 sampleColor = PassSrg::m_inputColor.Sample(PassSrg::m_sampler, sampleUV).rgb;
+            godRayAccum += sampleColor * skyMask * illuminationDecay * PassSrg::m_godRayWeight;
+            illuminationDecay *= PassSrg::m_godRayDecay;
+        }
+
+        // Fog scatters sunlight — rays are stronger where fog is denser.
+        float fogScatter = lerp(0.3f, 1.0f, fogFactor);
+
+        result += godRayAccum
+                * fogScatter
+                * PassSrg::m_godRayExposure
+                * PassSrg::m_godRayIntensity
+                * PassSrg::m_sunColor;
+    }
+
+    OUT.m_color = float4(result, sceneColor.a);
+    return OUT;
+}

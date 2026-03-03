@@ -1,0 +1,137 @@
+/*
+ * VolumetricFog.azsl
+ * Atmospheric fog + screen-space god rays.
+ * Post-process pass for O3DE Atom renderer.
+ *
+ * DEPTH: DepthPrePass.DepthLinear = view-space Z in WORLD UNITS (meters).
+ */
+
+#include <Atom/RPI/Math.azsli>
+#include <Atom/Features/PostProcessing/FullscreenVertex.azsli>
+#include <Atom/Features/PostProcessing/FullscreenPixelInfo.azsli>
+
+#include <scenesrg_all.srgi>
+#include <viewsrg_all.srgi>
+
+ShaderResourceGroup PassSrg : SRG_PerPass_WithFallback
+{
+    Texture2D<float4> m_inputColor;
+    Texture2D<float>  m_inputDepth;
+
+    // ---- Fog ----
+    float3 m_fogColor;
+    float  m_fogDensity;
+
+    float  m_fogHeightFalloff;   // reserved
+    float  m_fogBaseHeight;      // reserved
+    float  m_fogStartDistance;
+    float  m_fogEndDistance;
+
+    float  m_fogMaxOpacity;
+    int    m_enableFog;
+
+    // ---- God rays ----
+    float3 m_sunDirection;
+    float  m_godRayIntensity;
+
+    float3 m_sunColor;
+    float  m_godRayDecay;
+
+    float  m_godRayDensity;
+    float  m_godRayWeight;
+    int    m_godRaySamples;
+    float  m_godRayExposure;
+
+    int    m_enableGodRays;
+
+    Sampler m_sampler
+    {
+        MinFilter = Linear;
+        MagFilter = Linear;
+        MipFilter = Linear;
+        AddressU  = Clamp;
+        AddressV  = Clamp;
+        AddressW  = Clamp;
+    };
+};
+
+PSOutput MainPS(VSOutput IN)
+{
+    PSOutput OUT;
+
+    float2 uv         = IN.m_texCoord;
+    float4 sceneColor = PassSrg::m_inputColor.Sample(PassSrg::m_sampler, uv);
+    float  depth      = PassSrg::m_inputDepth.Sample(PassSrg::m_sampler, uv).r;
+    float3 result     = sceneColor.rgb;
+
+    // farZ с fallback на случай если GetFarZ() вернёт 0
+    float farZ = ViewSrg::GetFarZ();
+    if (farZ < 1.0f) farZ = 1000.0f;
+
+    float skyThreshold = farZ * 0.999f;
+
+    // =========================================================
+    // FOG — применяем ко всем пикселям кроме неба
+    // =========================================================
+    float fogFactor = 0.0f;
+
+    if (PassSrg::m_enableFog != 0 && depth < skyThreshold)
+    {
+        float dist  = depth; // view-space Z = расстояние от камеры в метрах
+        float range = max(PassSrg::m_fogEndDistance - PassSrg::m_fogStartDistance, 0.01f);
+        float t     = saturate((dist - PassSrg::m_fogStartDistance) / range);
+
+        // Стандартный экспоненциальный туман
+        fogFactor = 1.0f - exp(-PassSrg::m_fogDensity * t * 2.0f);
+        fogFactor = min(saturate(fogFactor), PassSrg::m_fogMaxOpacity);
+
+        result = lerp(result, PassSrg::m_fogColor, fogFactor);
+    }
+
+    // =========================================================
+    // GOD RAYS
+    // =========================================================
+    if (PassSrg::m_enableGodRays != 0)
+    {
+        float3 sunWorldPos = ViewSrg::m_worldPosition - PassSrg::m_sunDirection * 10000.0f;
+        float4 sunClip     = mul(ViewSrg::m_viewProjectionMatrix, float4(sunWorldPos, 1.0f));
+
+        float2 sunUV;
+        if (sunClip.w > 0.001f)
+        {
+            sunUV   = (sunClip.xy / sunClip.w) * 0.5f + 0.5f;
+            sunUV.y = 1.0f - sunUV.y;
+        }
+        else
+        {
+            sunUV = float2(0.5f, 0.5f);
+        }
+
+        int    samples = clamp(PassSrg::m_godRaySamples, 4, 128);
+        float2 stepUV  = (uv - sunUV) * (PassSrg::m_godRayDensity / float(samples));
+
+        float  decay = 1.0f;
+        float3 accum = float3(0.0f, 0.0f, 0.0f);
+        float2 sUV   = uv;
+
+        for (int i = 0; i < samples; ++i)
+        {
+            sUV -= stepUV;
+            sUV  = saturate(sUV);
+
+            float  sDepth  = PassSrg::m_inputDepth.Sample(PassSrg::m_sampler, sUV).r;
+            float  skyMask = step(skyThreshold, sDepth); // 1 = небо, 0 = геометрия
+            float3 sColor  = PassSrg::m_inputColor.Sample(PassSrg::m_sampler, sUV).rgb;
+
+            accum += sColor * skyMask * decay * PassSrg::m_godRayWeight;
+            decay *= PassSrg::m_godRayDecay;
+        }
+
+        float scatter = lerp(0.3f, 1.0f, fogFactor);
+        result += accum * scatter * PassSrg::m_godRayExposure
+                * PassSrg::m_godRayIntensity * PassSrg::m_sunColor;
+    }
+
+    OUT.m_color = float4(result, sceneColor.a);
+    return OUT;
+}

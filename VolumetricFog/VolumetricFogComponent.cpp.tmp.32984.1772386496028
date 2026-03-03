@@ -1,0 +1,289 @@
+#include "VolumetricFogComponent.h"
+
+#include <AzCore/Serialization/SerializeContext.h>
+#include <AzCore/Serialization/EditContext.h>
+
+// Atom RPI includes - only available on client/editor, not server
+#if !defined(ECHO_SERVER)
+#include <Atom/RPI.Public/Pass/PassFilter.h>
+#include <Atom/RPI.Public/Pass/PassSystemInterface.h>
+#include <Atom/RPI.Public/Pass/FullscreenTrianglePass.h>
+#include <Atom/RPI.Public/Shader/ShaderResourceGroup.h>
+#endif
+
+namespace echo
+{
+    // ============================================================
+    // VolumetricFogSettings::Reflect
+    // ============================================================
+    void VolumetricFogSettings::Reflect(AZ::ReflectContext* context)
+    {
+        if (auto* serialize = azrtti_cast<AZ::SerializeContext*>(context))
+        {
+            serialize->Class<VolumetricFogSettings>()
+                ->Version(1)
+                ->Field("EnableFog",        &VolumetricFogSettings::m_enableFog)
+                ->Field("FogColor",         &VolumetricFogSettings::m_fogColor)
+                ->Field("FogDensity",       &VolumetricFogSettings::m_fogDensity)
+                ->Field("FogHeightFalloff", &VolumetricFogSettings::m_fogHeightFalloff)
+                ->Field("FogBaseHeight",    &VolumetricFogSettings::m_fogBaseHeight)
+                ->Field("FogStartDist",     &VolumetricFogSettings::m_fogStartDistance)
+                ->Field("FogEndDist",       &VolumetricFogSettings::m_fogEndDistance)
+                ->Field("FogMaxOpacity",    &VolumetricFogSettings::m_fogMaxOpacity)
+                ->Field("EnableGodRays",    &VolumetricFogSettings::m_enableGodRays)
+                ->Field("SunColor",         &VolumetricFogSettings::m_sunColor)
+                ->Field("SunDirection",     &VolumetricFogSettings::m_sunDirection)
+                ->Field("GodRayIntensity",  &VolumetricFogSettings::m_godRayIntensity)
+                ->Field("GodRayDecay",      &VolumetricFogSettings::m_godRayDecay)
+                ->Field("GodRayDensity",    &VolumetricFogSettings::m_godRayDensity)
+                ->Field("GodRayWeight",     &VolumetricFogSettings::m_godRayWeight)
+                ->Field("GodRaySamples",    &VolumetricFogSettings::m_godRaySamples)
+                ->Field("GodRayExposure",   &VolumetricFogSettings::m_godRayExposure)
+            ;
+
+            if (auto* edit = serialize->GetEditContext())
+            {
+                edit->Class<VolumetricFogSettings>("Volumetric Fog Settings", "")
+                    ->ClassElement(AZ::Edit::ClassElements::EditorData, "")
+                        ->Attribute(AZ::Edit::Attributes::AutoExpand, true)
+
+                    ->ClassElement(AZ::Edit::ClassElements::Group, "Fog")
+                        ->Attribute(AZ::Edit::Attributes::AutoExpand, true)
+                    ->DataElement(AZ::Edit::UIHandlers::CheckBox,
+                        &VolumetricFogSettings::m_enableFog, "Enable Fog", "")
+                    ->DataElement(AZ::Edit::UIHandlers::Color,
+                        &VolumetricFogSettings::m_fogColor, "Fog Color", "")
+                    ->DataElement(AZ::Edit::UIHandlers::Slider,
+                        &VolumetricFogSettings::m_fogDensity, "Density", "")
+                        ->Attribute(AZ::Edit::Attributes::Min, 0.0f)
+                        ->Attribute(AZ::Edit::Attributes::Max, 10.0f)
+                    ->DataElement(AZ::Edit::UIHandlers::Slider,
+                        &VolumetricFogSettings::m_fogHeightFalloff, "Height Falloff", "")
+                        ->Attribute(AZ::Edit::Attributes::Min, 0.0f)
+                        ->Attribute(AZ::Edit::Attributes::Max, 1.0f)
+                    ->DataElement(AZ::Edit::UIHandlers::Default,
+                        &VolumetricFogSettings::m_fogBaseHeight, "Base Height", "")
+                    ->DataElement(AZ::Edit::UIHandlers::Default,
+                        &VolumetricFogSettings::m_fogStartDistance, "Start Distance", "")
+                    ->DataElement(AZ::Edit::UIHandlers::Default,
+                        &VolumetricFogSettings::m_fogEndDistance, "End Distance", "")
+                    ->DataElement(AZ::Edit::UIHandlers::Slider,
+                        &VolumetricFogSettings::m_fogMaxOpacity, "Max Opacity", "")
+                        ->Attribute(AZ::Edit::Attributes::Min, 0.0f)
+                        ->Attribute(AZ::Edit::Attributes::Max, 1.0f)
+
+                    ->ClassElement(AZ::Edit::ClassElements::Group, "God Rays")
+                        ->Attribute(AZ::Edit::Attributes::AutoExpand, true)
+                    ->DataElement(AZ::Edit::UIHandlers::CheckBox,
+                        &VolumetricFogSettings::m_enableGodRays, "Enable God Rays", "")
+                    ->DataElement(AZ::Edit::UIHandlers::Color,
+                        &VolumetricFogSettings::m_sunColor, "Sun Color", "")
+                    ->DataElement(AZ::Edit::UIHandlers::Default,
+                        &VolumetricFogSettings::m_sunDirection, "Sun Direction", "")
+                    ->DataElement(AZ::Edit::UIHandlers::Slider,
+                        &VolumetricFogSettings::m_godRayIntensity, "Intensity", "")
+                        ->Attribute(AZ::Edit::Attributes::Min, 0.0f)
+                        ->Attribute(AZ::Edit::Attributes::Max, 10.0f)
+                    ->DataElement(AZ::Edit::UIHandlers::Slider,
+                        &VolumetricFogSettings::m_godRayDecay, "Decay", "")
+                        ->Attribute(AZ::Edit::Attributes::Min, 0.8f)
+                        ->Attribute(AZ::Edit::Attributes::Max, 1.0f)
+                    ->DataElement(AZ::Edit::UIHandlers::Slider,
+                        &VolumetricFogSettings::m_godRayExposure, "Exposure", "")
+                        ->Attribute(AZ::Edit::Attributes::Min, 0.0f)
+                        ->Attribute(AZ::Edit::Attributes::Max, 1.0f)
+                    ->DataElement(AZ::Edit::UIHandlers::SpinBox,
+                        &VolumetricFogSettings::m_godRaySamples, "Ray Samples", "16-128")
+                        ->Attribute(AZ::Edit::Attributes::Min, 16)
+                        ->Attribute(AZ::Edit::Attributes::Max, 128)
+                ;
+            }
+        }
+    }
+
+    // ============================================================
+    // VolumetricFogComponent::Reflect
+    // ============================================================
+    void VolumetricFogComponent::Reflect(AZ::ReflectContext* context)
+    {
+        VolumetricFogSettings::Reflect(context);
+
+        if (auto* serialize = azrtti_cast<AZ::SerializeContext*>(context))
+        {
+            serialize->Class<VolumetricFogComponent, AZ::Component>()
+                ->Version(1)
+                ->Field("Settings", &VolumetricFogComponent::m_settings)
+            ;
+
+            if (auto* edit = serialize->GetEditContext())
+            {
+                edit->Class<VolumetricFogComponent>(
+                    "Volumetric Fog", "Atmospheric fog with god rays")
+                    ->ClassElement(AZ::Edit::ClassElements::EditorData, "")
+                        ->Attribute(AZ::Edit::Attributes::Category, "Echo/Rendering")
+                        ->Attribute(AZ::Edit::Attributes::AppearsInAddComponentMenu, AZ_CRC_CE("Game"))
+                        ->Attribute(AZ::Edit::Attributes::AutoExpand, true)
+                    ->DataElement(AZ::Edit::UIHandlers::Default,
+                        &VolumetricFogComponent::m_settings, "Fog Settings", "")
+                ;
+            }
+        }
+    }
+
+    void VolumetricFogComponent::GetProvidedServices(AZ::ComponentDescriptor::DependencyArrayType& provided)
+    {
+        provided.push_back(AZ_CRC_CE("VolumetricFogService"));
+    }
+
+    void VolumetricFogComponent::GetIncompatibleServices(AZ::ComponentDescriptor::DependencyArrayType& incompatible)
+    {
+        incompatible.push_back(AZ_CRC_CE("VolumetricFogService"));
+    }
+
+    // ============================================================
+    // Lifecycle
+    // ============================================================
+    void VolumetricFogComponent::Activate()
+    {
+        m_passReady = false;
+        VolumetricFogRequestBus::Handler::BusConnect(GetEntityId());
+        AZ::TickBus::Handler::BusConnect();
+    }
+
+    void VolumetricFogComponent::Deactivate()
+    {
+        AZ::TickBus::Handler::BusDisconnect();
+        VolumetricFogRequestBus::Handler::BusDisconnect();
+        m_passReady = false;
+    }
+
+    void VolumetricFogComponent::OnTick(float /*deltaTime*/, AZ::ScriptTimePoint /*time*/)
+    {
+        // Обновляем каждый кадр — Atom SRG использует ring buffer (3 кадра),
+        // поэтому SetConstant нужно вызывать каждый кадр, иначе значения сбрасываются.
+        if (UpdatePassParameters())
+        {
+            m_passReady = true;
+            // НЕ отключаемся от TickBus — продолжаем обновлять каждый кадр
+        }
+    }
+
+    // ============================================================
+    // UpdatePassParameters - только на клиенте/редакторе
+    // ============================================================
+    bool VolumetricFogComponent::UpdatePassParameters()
+    {
+#if !defined(ECHO_SERVER)
+        // Найти pass
+        AZ::RPI::PassFilter filter = AZ::RPI::PassFilter::CreateWithPassName(
+            AZ::Name("VolumetricFogPass"), static_cast<AZ::RPI::Scene*>(nullptr));
+
+        AZ::RPI::Pass* foundPass = nullptr;
+        AZ::RPI::PassSystemInterface::Get()->ForEachPass(filter,
+            [&foundPass](AZ::RPI::Pass* pass) -> AZ::RPI::PassFilterExecutionFlow
+            {
+                foundPass = pass;
+                return AZ::RPI::PassFilterExecutionFlow::StopVisitingPasses;
+            });
+
+        if (!foundPass)
+        {
+            AZ_TracePrintf("VolumetricFog", "UpdatePassParameters: pass 'VolumetricFogPass' NOT FOUND");
+            return false;
+        }
+
+        foundPass->SetEnabled(m_settings.m_enableFog || m_settings.m_enableGodRays);
+
+        auto* fullscreenPass = azrtti_cast<AZ::RPI::FullscreenTrianglePass*>(foundPass);
+        if (!fullscreenPass)
+        {
+            AZ_Warning("VolumetricFog", false, "UpdatePassParameters: azrtti_cast to FullscreenTrianglePass FAILED (pass name: %s)",
+                foundPass->GetName().GetCStr());
+            return false;
+        }
+
+        auto srg = fullscreenPass->GetShaderResourceGroup();
+        if (!srg)
+        {
+            AZ_Warning("VolumetricFog", false, "UpdatePassParameters: GetShaderResourceGroup() is NULL — shader not compiled?");
+            return false;
+        }
+
+        // Fog параметры
+        AZ::RHI::ShaderInputConstantIndex fogColorIdx = srg->FindShaderInputConstantIndex(AZ::Name("m_fogColor"));
+        AZ::RHI::ShaderInputConstantIndex fogDensityIdx = srg->FindShaderInputConstantIndex(AZ::Name("m_fogDensity"));
+        AZ::RHI::ShaderInputConstantIndex fogHeightIdx = srg->FindShaderInputConstantIndex(AZ::Name("m_fogHeightFalloff"));
+        AZ::RHI::ShaderInputConstantIndex fogBaseIdx = srg->FindShaderInputConstantIndex(AZ::Name("m_fogBaseHeight"));
+        AZ::RHI::ShaderInputConstantIndex fogStartIdx = srg->FindShaderInputConstantIndex(AZ::Name("m_fogStartDistance"));
+        AZ::RHI::ShaderInputConstantIndex fogEndIdx = srg->FindShaderInputConstantIndex(AZ::Name("m_fogEndDistance"));
+        AZ::RHI::ShaderInputConstantIndex fogOpacityIdx = srg->FindShaderInputConstantIndex(AZ::Name("m_fogMaxOpacity"));
+        AZ::RHI::ShaderInputConstantIndex fogEnableIdx = srg->FindShaderInputConstantIndex(AZ::Name("m_enableFog"));
+
+        // God ray параметры
+        AZ::RHI::ShaderInputConstantIndex sunDirIdx = srg->FindShaderInputConstantIndex(AZ::Name("m_sunDirection"));
+        AZ::RHI::ShaderInputConstantIndex sunColorIdx = srg->FindShaderInputConstantIndex(AZ::Name("m_sunColor"));
+        AZ::RHI::ShaderInputConstantIndex rayIntIdx = srg->FindShaderInputConstantIndex(AZ::Name("m_godRayIntensity"));
+        AZ::RHI::ShaderInputConstantIndex rayDecIdx = srg->FindShaderInputConstantIndex(AZ::Name("m_godRayDecay"));
+        AZ::RHI::ShaderInputConstantIndex rayDenIdx = srg->FindShaderInputConstantIndex(AZ::Name("m_godRayDensity"));
+        AZ::RHI::ShaderInputConstantIndex rayWgtIdx = srg->FindShaderInputConstantIndex(AZ::Name("m_godRayWeight"));
+        AZ::RHI::ShaderInputConstantIndex raySmpIdx = srg->FindShaderInputConstantIndex(AZ::Name("m_godRaySamples"));
+        AZ::RHI::ShaderInputConstantIndex rayExpIdx = srg->FindShaderInputConstantIndex(AZ::Name("m_godRayExposure"));
+        AZ::RHI::ShaderInputConstantIndex rayEnableIdx = srg->FindShaderInputConstantIndex(AZ::Name("m_enableGodRays"));
+
+        if (fogColorIdx.IsNull())
+        {
+            AZ_Warning("VolumetricFog", false, "UpdatePassParameters: SRG constant 'm_fogColor' not found — shader SRG mismatch");
+            return false;
+        }
+
+        AZ_TracePrintf("VolumetricFog", "UpdatePassParameters: pass found, SRG valid, enableFog=%d enableGodRays=%d",
+            (int)m_settings.m_enableFog, (int)m_settings.m_enableGodRays);
+
+        AZ::Vector3 fogColor(m_settings.m_fogColor.GetR(), m_settings.m_fogColor.GetG(), m_settings.m_fogColor.GetB());
+        AZ::Vector3 sunColor(m_settings.m_sunColor.GetR(), m_settings.m_sunColor.GetG(), m_settings.m_sunColor.GetB());
+        AZ::Vector3 sunDir = m_settings.m_sunDirection.GetNormalized();
+        int enableFog = m_settings.m_enableFog ? 1 : 0;
+        int enableGodRays = m_settings.m_enableGodRays ? 1 : 0;
+
+        srg->SetConstant(fogColorIdx, fogColor);
+        srg->SetConstant(fogDensityIdx, m_settings.m_fogDensity);
+        srg->SetConstant(fogHeightIdx, m_settings.m_fogHeightFalloff);
+        srg->SetConstant(fogBaseIdx, m_settings.m_fogBaseHeight);
+        srg->SetConstant(fogStartIdx, m_settings.m_fogStartDistance);
+        srg->SetConstant(fogEndIdx, m_settings.m_fogEndDistance);
+        srg->SetConstant(fogOpacityIdx, m_settings.m_fogMaxOpacity);
+        srg->SetConstant(fogEnableIdx, enableFog);
+        srg->SetConstant(sunDirIdx, sunDir);
+        srg->SetConstant(sunColorIdx, sunColor);
+        srg->SetConstant(rayIntIdx, m_settings.m_godRayIntensity);
+        srg->SetConstant(rayDecIdx, m_settings.m_godRayDecay);
+        srg->SetConstant(rayDenIdx, m_settings.m_godRayDensity);
+        srg->SetConstant(rayWgtIdx, m_settings.m_godRayWeight);
+        srg->SetConstant(raySmpIdx, m_settings.m_godRaySamples);
+        srg->SetConstant(rayExpIdx, m_settings.m_godRayExposure);
+        srg->SetConstant(rayEnableIdx, enableGodRays);
+
+        return true;
+#else
+        return false;
+#endif
+    }
+
+    // ============================================================
+    // EBus handlers
+    // ============================================================
+    void VolumetricFogComponent::SetFogEnabled(bool v)                 { m_settings.m_enableFog = v;         if (m_passReady) UpdatePassParameters(); }
+    void VolumetricFogComponent::SetFogDensity(float v)                { m_settings.m_fogDensity = v;        if (m_passReady) UpdatePassParameters(); }
+    void VolumetricFogComponent::SetFogColor(const AZ::Color& v)       { m_settings.m_fogColor = v;          if (m_passReady) UpdatePassParameters(); }
+    void VolumetricFogComponent::SetFogHeightFalloff(float v)          { m_settings.m_fogHeightFalloff = v;  if (m_passReady) UpdatePassParameters(); }
+    void VolumetricFogComponent::SetFogBaseHeight(float v)             { m_settings.m_fogBaseHeight = v;     if (m_passReady) UpdatePassParameters(); }
+    void VolumetricFogComponent::SetFogStartDistance(float v)          { m_settings.m_fogStartDistance = v;  if (m_passReady) UpdatePassParameters(); }
+    void VolumetricFogComponent::SetFogEndDistance(float v)            { m_settings.m_fogEndDistance = v;    if (m_passReady) UpdatePassParameters(); }
+    void VolumetricFogComponent::SetFogMaxOpacity(float v)             { m_settings.m_fogMaxOpacity = v;     if (m_passReady) UpdatePassParameters(); }
+    void VolumetricFogComponent::SetGodRaysEnabled(bool v)             { m_settings.m_enableGodRays = v;     if (m_passReady) UpdatePassParameters(); }
+    void VolumetricFogComponent::SetGodRayIntensity(float v)           { m_settings.m_godRayIntensity = v;   if (m_passReady) UpdatePassParameters(); }
+    void VolumetricFogComponent::SetGodRaySamples(int v)               { m_settings.m_godRaySamples = v;     if (m_passReady) UpdatePassParameters(); }
+    void VolumetricFogComponent::SetSunDirection(const AZ::Vector3& v) { m_settings.m_sunDirection = v;      if (m_passReady) UpdatePassParameters(); }
+    void VolumetricFogComponent::SetSunColor(const AZ::Color& v)       { m_settings.m_sunColor = v;          if (m_passReady) UpdatePassParameters(); }
+
+} // namespace echo

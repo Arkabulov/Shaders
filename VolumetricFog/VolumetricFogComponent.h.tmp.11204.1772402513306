@@ -1,0 +1,109 @@
+#pragma once
+
+#include <AzCore/Component/Component.h>
+#include <AzCore/Component/TickBus.h>
+#include <AzCore/Math/Color.h>
+#include <AzCore/Math/Vector3.h>
+
+namespace echo
+{
+    class VolumetricFogRequests : public AZ::EBusTraits
+    {
+    public:
+        static const AZ::EBusAddressPolicy AddressPolicy = AZ::EBusAddressPolicy::ById;
+        using BusIdType = AZ::EntityId;
+
+        virtual void SetFogEnabled(bool enabled) = 0;
+        virtual void SetFogDensity(float density) = 0;
+        virtual void SetFogColor(const AZ::Color& color) = 0;
+        virtual void SetFogHeightFalloff(float falloff) = 0;
+        virtual void SetFogBaseHeight(float height) = 0;
+        virtual void SetFogStartDistance(float dist) = 0;
+        virtual void SetFogEndDistance(float dist) = 0;
+        virtual void SetFogMaxOpacity(float opacity) = 0;
+        virtual void SetGodRaysEnabled(bool enabled) = 0;
+        virtual void SetGodRayIntensity(float intensity) = 0;
+        virtual void SetGodRaySamples(int samples) = 0;
+        virtual void SetSunDirection(const AZ::Vector3& direction) = 0;
+        virtual void SetSunColor(const AZ::Color& color) = 0;
+    };
+
+    using VolumetricFogRequestBus = AZ::EBus<VolumetricFogRequests>;
+
+    struct VolumetricFogSettings
+    {
+        AZ_TYPE_INFO(VolumetricFogSettings, "{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}");
+        AZ_CLASS_ALLOCATOR(VolumetricFogSettings, AZ::SystemAllocator, 0);
+
+        static void Reflect(AZ::ReflectContext* context);
+
+        bool        m_enableFog         = true;
+        AZ::Color   m_fogColor          = AZ::Color(0.82f, 0.87f, 0.92f, 1.0f); // cool grey mist
+        float       m_fogDensity        = 1.5f;
+        float       m_fogHeightFalloff  = 0.05f;  // gentle height gradient
+        float       m_fogBaseHeight     = 0.0f;
+        float       m_fogStartDistance  = 2.0f;   // fog starts very close
+        float       m_fogEndDistance    = 120.0f; // fully dense at 120 m
+        float       m_fogMaxOpacity     = 0.92f;
+
+        // Volumetric noise settings
+        float       m_fogNoiseScale     = 0.025f; // world-space frequency (smaller = bigger billows)
+        float       m_fogNoiseSpeed     = 0.5f;   // drift speed (m/s)
+        int         m_fogSamples        = 24;     // raymarch steps [4..64]
+
+        bool        m_enableGodRays     = true;
+        AZ::Color   m_sunColor          = AZ::Color(1.0f, 0.95f, 0.8f, 1.0f);
+        AZ::Vector3 m_sunDirection      = AZ::Vector3(0.3f, 0.5f, -0.8f);
+        float       m_godRayIntensity   = 2.5f;
+        float       m_godRayDecay       = 0.97f;
+        float       m_godRayDensity     = 0.96f;
+        float       m_godRayWeight      = 0.5f;
+        int         m_godRaySamples     = 64;
+        float       m_godRayExposure    = 0.35f;
+        float       m_scatterAnisotropy = 0.65f;  // Henyey-Greenstein g
+        float       m_godRayThreshold   = 0.3f;   // sky luminance min
+    };
+
+    class VolumetricFogComponent
+        : public AZ::Component
+        , public VolumetricFogRequestBus::Handler
+        , public AZ::TickBus::Handler
+    {
+    public:
+        AZ_COMPONENT(VolumetricFogComponent, "{B2C3D4E5-F6A7-8901-BCDE-F12345678901}");
+
+        static void Reflect(AZ::ReflectContext* context);
+        static void GetProvidedServices(AZ::ComponentDescriptor::DependencyArrayType& provided);
+        static void GetIncompatibleServices(AZ::ComponentDescriptor::DependencyArrayType& incompatible);
+
+        void Activate() override;
+        void Deactivate() override;
+
+        // TickBus
+        void OnTick(float deltaTime, AZ::ScriptTimePoint time) override;
+
+        // VolumetricFogRequestBus
+        void SetFogEnabled(bool enabled) override;
+        void SetFogDensity(float density) override;
+        void SetFogColor(const AZ::Color& color) override;
+        void SetFogHeightFalloff(float falloff) override;
+        void SetFogBaseHeight(float height) override;
+        void SetFogStartDistance(float dist) override;
+        void SetFogEndDistance(float dist) override;
+        void SetFogMaxOpacity(float opacity) override;
+        void SetGodRaysEnabled(bool enabled) override;
+        void SetGodRayIntensity(float intensity) override;
+        void SetGodRaySamples(int samples) override;
+        void SetSunDirection(const AZ::Vector3& direction) override;
+        void SetSunColor(const AZ::Color& color) override;
+
+    private:
+        // Возвращает true если pass найден и параметры успешно установлены
+        bool UpdatePassParameters();
+
+        VolumetricFogSettings m_settings;
+        bool  m_passReady = false;  // true после первого успешного обновления
+        float m_time      = 0.0f;  // накопленное время для анимации шума
+    };
+
+} // namespace echo

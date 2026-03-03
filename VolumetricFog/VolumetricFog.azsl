@@ -1,0 +1,485 @@
+/*
+ * VolumetricFog.azsl  —  Clustered Volumetric Fog
+ *
+ * Post-process FullscreenTrianglePass for O3DE Atom renderer.
+ * Uses NVLC tiled light culling (TileLightData + LightListRemapped) to
+ * evaluate ALL culled scene lights via Beer-Lambert extinction + HG phase.
+ *
+ * MIRROR of Gem/Assets/Shaders/VolumetricFog/VolumetricFog.azsl.
+ * The pass resolves "Shaders/VolumetricFog/VolumetricFog.shader" to the
+ * Gem-level file; this project-level copy is kept in sync as a fallback
+ * and for IDE/tool discoverability.
+ *
+ * NVLC group order (LightCullingParent.pass / LightCullingTileIterator):
+ *   0 = Decals          (skipped)
+ *   1 = SimplePoint     → ViewSrg::m_simplePointLights  (SimplePointLight)
+ *   2 = SimpleSpot      → ViewSrg::m_simpleSpotLights   (SimpleSpotLight)
+ *   3 = PointSphere     → ViewSrg::m_pointLights        (PointLight / sphere area)
+ *   4 = Disk            → ViewSrg::m_diskLights         (DiskLight)
+ *   5 = Capsule         → ViewSrg::m_capsuleLights      (CapsuleLight)
+ *   6+ = Quad/Polygon   (skipped — area LTC not worth evaluating for fog)
+ *
+ * Debug: define VF_DEBUG_LIGHT_COUNT 1 to visualize collected light count
+ *   (red = 0 lights, green gradient = 1..N lights). Default OFF.
+ */
+
+#include <Atom/RPI/Math.azsli>
+#include <Atom/Features/PostProcessing/FullscreenVertex.azsli>
+#include <Atom/Features/PostProcessing/FullscreenPixelInfo.azsli>
+
+#include <scenesrg_all.srgi>
+#include <viewsrg_all.srgi>
+
+// Lock in light culling.  Without this the root shader variant (variant 0)
+// sets ENABLE_LIGHT_CULLING=0, making LightCullingTileIterator::Init() a
+// no-op that ignores its resource arguments.  DXC then strips
+// m_tileLightData / m_lightListRemapped from the compiled SRG layout, which
+// causes "Could not retrieve Shader Image/Buffer Index" errors at runtime.
+#ifndef ENABLE_LIGHT_CULLING
+#define ENABLE_LIGHT_CULLING 1
+#endif
+#include <Atom/Features/LightCulling/LightCullingTileIterator.azsli>
+#include <Atom/Features/PBR/Lights/LightStructures.azsli>
+
+// ============================================================
+// Debug toggle — set to 1 to overlay collected light count.
+//   Red   = 0 local lights reached the tile iterator.
+//   Green = 1..MAX_LIGHTS_PER_TYPE*5 lights collected.
+// Change, recompile, reload (no C++ rebuild needed).  Default: OFF.
+// ============================================================
+#ifndef VF_DEBUG_LIGHT_COUNT
+#define VF_DEBUG_LIGHT_COUNT 0
+#endif
+
+// ============================================================
+// PassSrg
+// ============================================================
+ShaderResourceGroup PassSrg : SRG_PerPass_WithFallback
+{
+    Texture2D<float4>       m_inputColor;
+    Texture2D<float>        m_inputDepth;    // linear eye-space depth (positive)
+
+    // Tiled light culling resources — connected from LightCullingPass slots.
+    Texture2D<uint4>        m_tileLightData;
+    StructuredBuffer<uint>  m_lightListRemapped;
+
+    // ---- Fog base --------------------------------------------------------
+    float3 m_fogColor;
+    float  m_fogDensity;
+
+    float  m_fogHeightFalloff;
+    float  m_fogBaseHeight;
+    float  m_fogStartDistance;
+    float  m_fogEndDistance;
+
+    float  m_fogMaxOpacity;
+    int    m_enableFog;
+
+    // ---- Noise -----------------------------------------------------------
+    float  m_fogNoiseScale;
+    float  m_fogNoiseSpeed;
+    float  m_time;
+    int    m_fogSamples;
+
+    // ---- Scatter anisotropy (Henyey-Greenstein g) ------------------------
+    float  m_scatterAnisotropy;
+
+    // ---- Legacy god-ray fields (kept for SRG / serialization compat) ------
+    // Values are not used; layout must match VolumetricFogComponent constants.
+    float  m_godRayIntensity;
+    float  m_godRayDecay;
+    float  m_godRayDensity;
+    float  m_godRayWeight;
+    int    m_godRaySamples;
+    float  m_godRayExposure;
+    int    m_enableGodRays;
+    float  m_godRayThreshold;
+
+    // Directional-light scale.  Scales down sun lux so it matches
+    // the visual weight of local candela lights.  Default ~0.003.
+    float  m_fogLightScatter;
+
+    Sampler m_sampler
+    {
+        MinFilter = Linear;
+        MagFilter = Linear;
+        MipFilter = Linear;
+        AddressU  = Clamp;
+        AddressV  = Clamp;
+        AddressW  = Clamp;
+    };
+};
+
+// ============================================================
+// Constants
+// ============================================================
+#define MAX_LIGHTS_PER_TYPE  16      // max culled indices collected per group
+
+static const float VF_PI = 3.14159265f;
+
+// ============================================================
+// Noise helpers (value noise, 3-octave FBM)
+// ============================================================
+float Hash1(float3 p)
+{
+    p  = frac(p * float3(127.1f, 311.7f, 74.7f));
+    p += dot(p.zxy, p.yzx + 19.19f);
+    return frac(p.x * p.y * p.z);
+}
+
+float VNoise(float3 x)
+{
+    float3 i = floor(x);
+    float3 f = frac(x);
+    float3 u = f * f * (3.0f - 2.0f * f);
+    return lerp(
+        lerp(lerp(Hash1(i),                 Hash1(i + float3(1,0,0)), u.x),
+             lerp(Hash1(i + float3(0,1,0)), Hash1(i + float3(1,1,0)), u.x), u.y),
+        lerp(lerp(Hash1(i + float3(0,0,1)), Hash1(i + float3(1,0,1)), u.x),
+             lerp(Hash1(i + float3(0,1,1)), Hash1(i + float3(1,1,1)), u.x), u.y),
+        u.z);
+}
+
+float FBM(float3 p)
+{
+    return  VNoise(p)                                       * 0.65f
+          + VNoise(p * 2.1f + float3(5.1f, 1.7f, 3.3f))    * 0.28f
+          + VNoise(p * 4.3f + float3(1.3f, 4.9f, 7.1f))    * 0.07f;
+}
+
+// ============================================================
+// Henyey-Greenstein Mie scattering phase function
+// ============================================================
+float HenyeyGreenstein(float cosTheta, float g)
+{
+    float g2 = g * g;
+    float d  = max(1.0f + g2 - 2.0f * g * cosTheta, 0.0001f);
+    return (1.0f - g2) / (4.0f * VF_PI * pow(d, 1.5f));
+}
+
+// ============================================================
+// World-space ray direction from screen UV
+// ============================================================
+float3 GetRayDir(float2 uv)
+{
+    float2 ndc  = float2(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f);
+    float4 farW = mul(ViewSrg::m_viewProjectionInverseMatrix, float4(ndc, 1.0f, 1.0f));
+    farW.xyz   /= farW.w;
+    return normalize(farW.xyz - ViewSrg::m_worldPosition);
+}
+
+// ============================================================
+// Fog density: height falloff * animated FBM noise
+// ============================================================
+float GetFogDensity(float3 wpos)
+{
+    float heightAtten = exp(-max(0.0f, wpos.z - PassSrg::m_fogBaseHeight)
+                            * PassSrg::m_fogHeightFalloff);
+
+    float noiseDrift = PassSrg::m_time * PassSrg::m_fogNoiseSpeed * PassSrg::m_fogNoiseScale;
+    float3 np        = wpos * PassSrg::m_fogNoiseScale;
+    np.x += noiseDrift;
+    np.y += noiseDrift * 0.37f;
+
+    float n     = FBM(np);
+    float cloud = smoothstep(0.10f, 0.90f, n);
+    return PassSrg::m_fogDensity * cloud * heightAtten;
+}
+
+// Quadratic distance attenuation (matches O3DE's light formula)
+float PointAttenuation(float distSq, float invRadSq)
+{
+    float f = max(0.0f, 1.0f - distSq * invRadSq);
+    return f * f;
+}
+
+// ============================================================
+// Raymarched fog with clustered lighting
+// ============================================================
+struct FogResult { float3 scattered; float transmittance; int totalLights; };
+
+FogResult MarchFog(float2 uv, float2 screenPos, float3 rayDir, float marchEnd)
+{
+    FogResult result;
+    result.scattered     = 0.0f;
+    result.transmittance = 1.0f;
+    result.totalLights   = 0;
+
+    float marchStart = PassSrg::m_fogStartDistance;
+    if (marchEnd <= marchStart)
+        return result;
+
+    int   steps    = clamp(PassSrg::m_fogSamples, 4, 128);
+    float stepSize = (marchEnd - marchStart) / float(steps);
+
+    // Dithered step offset to break banding
+    float dither = frac(sin(dot(uv, float2(127.1f, 311.7f))) * 43758.5453f) * 0.5f;
+
+    float  g      = clamp(PassSrg::m_scatterAnisotropy, 0.0f, 0.99f);
+    float3 camPos = ViewSrg::m_worldPosition;
+
+    // ----------------------------------------------------------------
+    // Light collection from NVLC tile.
+    //
+    // Depth-bin selection: use the MIDPOINT of the fog march range.
+    // Using marchEnd alone misses lights that only land in the near
+    // depth bins (e.g. a point light sitting at march start distance).
+    // The midpoint is a single-sample compromise that covers the full
+    // fog volume reasonably without multi-bin iteration overhead.
+    // ----------------------------------------------------------------
+    float midDepth = 0.5f * (marchStart + marchEnd);
+
+    uint spIdx[MAX_LIGHTS_PER_TYPE];   // Group 1: SimplePoint
+    uint ssIdx[MAX_LIGHTS_PER_TYPE];   // Group 2: SimpleSpot
+    uint ptIdx[MAX_LIGHTS_PER_TYPE];   // Group 3: PointSphere (m_pointLights)
+    uint dkIdx[MAX_LIGHTS_PER_TYPE];   // Group 4: Disk
+    uint cpIdx[MAX_LIGHTS_PER_TYPE];   // Group 5: Capsule
+    int  nSP = 0, nSS = 0, nPT = 0, nDK = 0, nCP = 0;
+
+    LightCullingTileIterator iter;
+    iter.Init(float4(screenPos, 0.0f, midDepth),
+              PassSrg::m_lightListRemapped,
+              PassSrg::m_tileLightData);
+
+    // --- Group 0: Decals — consume and discard ---
+    iter.LoadAdvance();
+    [loop]
+    while (!iter.IsDone()) { iter.LoadAdvance(); }
+    bool listDone = (iter.GetValue() == NVLC_END_OF_LIST);
+
+    // --- Group 1: SimplePoint ---
+    if (!listDone)
+    {
+        iter.LoadAdvance();
+        [loop]
+        while (!iter.IsDone())
+        {
+            if (nSP < MAX_LIGHTS_PER_TYPE) spIdx[nSP++] = Light_GetIndex(iter.GetValue());
+            iter.LoadAdvance();
+        }
+        listDone = (iter.GetValue() == NVLC_END_OF_LIST);
+    }
+
+    // --- Group 2: SimpleSpot ---
+    if (!listDone)
+    {
+        iter.LoadAdvance();
+        [loop]
+        while (!iter.IsDone())
+        {
+            if (nSS < MAX_LIGHTS_PER_TYPE) ssIdx[nSS++] = Light_GetIndex(iter.GetValue());
+            iter.LoadAdvance();
+        }
+        listDone = (iter.GetValue() == NVLC_END_OF_LIST);
+    }
+
+    // --- Group 3: PointSphere (ViewSrg::m_pointLights, type PointLight) ---
+    // Standard O3DE "PointLightComponent" lights often land here.
+    if (!listDone)
+    {
+        iter.LoadAdvance();
+        [loop]
+        while (!iter.IsDone())
+        {
+            if (nPT < MAX_LIGHTS_PER_TYPE) ptIdx[nPT++] = Light_GetIndex(iter.GetValue());
+            iter.LoadAdvance();
+        }
+        listDone = (iter.GetValue() == NVLC_END_OF_LIST);
+    }
+
+    // --- Group 4: Disk ---
+    if (!listDone)
+    {
+        iter.LoadAdvance();
+        [loop]
+        while (!iter.IsDone())
+        {
+            if (nDK < MAX_LIGHTS_PER_TYPE) dkIdx[nDK++] = Light_GetIndex(iter.GetValue());
+            iter.LoadAdvance();
+        }
+        listDone = (iter.GetValue() == NVLC_END_OF_LIST);
+    }
+
+    // --- Group 5: Capsule ---
+    if (!listDone)
+    {
+        iter.LoadAdvance();
+        [loop]
+        while (!iter.IsDone())
+        {
+            if (nCP < MAX_LIGHTS_PER_TYPE) cpIdx[nCP++] = Light_GetIndex(iter.GetValue());
+            iter.LoadAdvance();
+        }
+        // Groups 6+ (Quad, Polygon) not collected
+    }
+
+    result.totalLights = nSP + nSS + nPT + nDK + nCP;
+
+    uint  nDir     = SceneSrg::m_directionalLightCount;
+    float dirScale = max(PassSrg::m_fogLightScatter, 0.0f);
+
+    // ----------------------------------------------------------------
+    // Raymarch — Beer-Lambert extinction + HG in-scatter per step
+    // ----------------------------------------------------------------
+    [loop]
+    for (int i = 0; i < steps; i++)
+    {
+        float  t    = marchStart + (float(i) + dither) * stepSize;
+        float3 wpos = camPos + rayDir * t;
+
+        float density = GetFogDensity(wpos);
+        if (density < 0.0005f) continue;
+
+        float  stepTrans = exp(-density * stepSize);
+        float3 inScatter = PassSrg::m_fogColor * 0.25f;   // ambient sky bounce
+
+        // ---- Directional lights ----------------------------------------
+        [loop]
+        for (uint di = 0; di < nDir; di++)
+        {
+            DirectionalLight dl = SceneSrg::m_directionalLights[di];
+            float3 toLight  = -normalize(dl.m_direction);
+            float  cosTheta = dot(rayDir, toLight);
+            float  phase    = HenyeyGreenstein(cosTheta, g);
+            inScatter      += dl.m_rgbIntensityLux * (phase * dirScale);
+        }
+
+        // ---- SimplePoint (group 1) -------------------------------------
+        [loop]
+        for (int si = 0; si < nSP; si++)
+        {
+            SimplePointLight l  = ViewSrg::m_simplePointLights[spIdx[si]];
+            float3 toLight      = l.m_position - wpos;
+            float  distSq       = dot(toLight, toLight);
+            float  atten        = PointAttenuation(distSq, l.m_invAttenuationRadiusSquared);
+            if (atten < 0.001f) continue;
+            float3 toLightN     = toLight * rsqrt(max(distSq, 0.0001f));
+            float  cosTheta     = dot(rayDir, toLightN);
+            float  phase        = HenyeyGreenstein(cosTheta, g);
+            inScatter          += l.m_rgbIntensityCandelas * (atten / max(distSq, 1.0f)) * phase;
+        }
+
+        // ---- SimpleSpot (group 2) --------------------------------------
+        [loop]
+        for (int si = 0; si < nSS; si++)
+        {
+            SimpleSpotLight l  = ViewSrg::m_simpleSpotLights[ssIdx[si]];
+            float3 toLight     = l.m_position - wpos;
+            float  distSq      = dot(toLight, toLight);
+            float  atten       = PointAttenuation(distSq, l.m_invAttenuationRadiusSquared);
+            if (atten < 0.001f) continue;
+            float3 toLightN    = toLight * rsqrt(max(distSq, 0.0001f));
+            float  cosAngle    = dot(-l.m_direction, toLightN);
+            float  cone        = smoothstep(l.m_cosOuterConeAngle, l.m_cosInnerConeAngle, cosAngle);
+            if (cone < 0.001f) continue;
+            float  cosTheta    = dot(rayDir, toLightN);
+            float  phase       = HenyeyGreenstein(cosTheta, g);
+            inScatter         += l.m_rgbIntensityCandelas * (atten / max(distSq, 1.0f)) * cone * phase;
+        }
+
+        // ---- PointSphere (group 3 — ViewSrg::m_pointLights) -----------
+        // These are sphere area lights (PointLight struct, m_bulbRadius > 0).
+        // Treat as omnidirectional with a clamped minimum distance to avoid
+        // a singularity when wpos is inside the bulb.
+        [loop]
+        for (int si = 0; si < nPT; si++)
+        {
+            PointLight l      = ViewSrg::m_pointLights[ptIdx[si]];
+            float3 toLight    = l.m_position - wpos;
+            float  distSq     = dot(toLight, toLight);
+            float  atten      = PointAttenuation(distSq, l.m_invAttenuationRadiusSquared);
+            if (atten < 0.001f) continue;
+            float3 toLightN   = toLight * rsqrt(max(distSq, 0.0001f));
+            float  cosTheta   = dot(rayDir, toLightN);
+            float  phase      = HenyeyGreenstein(cosTheta, g);
+            // Clamp distSq to bulb area to avoid over-bright singularity
+            float  dSqEff     = max(distSq, l.m_bulbRadius * l.m_bulbRadius + 0.001f);
+            inScatter        += l.m_rgbIntensityCandelas * (atten / max(dSqEff, 1.0f)) * phase;
+        }
+
+        // ---- Disk (group 4 — optional cone) ----------------------------
+        [loop]
+        for (int si = 0; si < nDK; si++)
+        {
+            DiskLight l      = ViewSrg::m_diskLights[dkIdx[si]];
+            float3 toLight   = l.m_position - wpos;
+            float  distSq    = dot(toLight, toLight);
+            float  atten     = PointAttenuation(distSq, l.m_invAttenuationRadiusSquared);
+            if (atten < 0.001f) continue;
+            float3 toLightN  = toLight * rsqrt(max(distSq, 0.0001f));
+            float  cone      = 1.0f;
+            if ((l.m_flags & 1u) != 0)   // DiskLightFlag::UseConeAngle == 1
+                cone = smoothstep(l.m_cosOuterConeAngle, l.m_cosInnerConeAngle,
+                                  dot(-l.m_direction, toLightN));
+            if (cone < 0.001f) continue;
+            float  cosTheta  = dot(rayDir, toLightN);
+            float  phase     = HenyeyGreenstein(cosTheta, g);
+            inScatter       += l.m_rgbIntensityCandelas * (atten / max(distSq, 1.0f)) * cone * phase;
+        }
+
+        // ---- Capsule (group 5 — closest point on segment) --------------
+        [loop]
+        for (int si = 0; si < nCP; si++)
+        {
+            CapsuleLight l   = ViewSrg::m_capsuleLights[cpIdx[si]];
+            float3 ap        = wpos - l.m_startPoint;
+            float  t2        = clamp(dot(ap, l.m_direction), 0.0f, l.m_length);
+            float3 closest   = l.m_startPoint + l.m_direction * t2;
+            float3 toLight   = closest - wpos;
+            float  distSq    = dot(toLight, toLight);
+            float  atten     = PointAttenuation(distSq, l.m_invAttenuationRadiusSquared);
+            if (atten < 0.001f) continue;
+            float3 toLightN  = toLight * rsqrt(max(distSq, 0.0001f));
+            float  cosTheta  = dot(rayDir, toLightN);
+            float  phase     = HenyeyGreenstein(cosTheta, g);
+            inScatter       += l.m_rgbIntensityCandelas * (atten / max(distSq, 1.0f)) * phase;
+        }
+
+        result.scattered     += result.transmittance * inScatter * density * stepSize;
+        result.transmittance *= stepTrans;
+
+        if (result.transmittance < 0.01f) break;   // early-out when fully opaque
+    }
+
+    result.transmittance = max(result.transmittance, 1.0f - PassSrg::m_fogMaxOpacity);
+    return result;
+}
+
+// ============================================================
+// Main pixel shader
+// ============================================================
+PSOutput MainPS(VSOutput IN)
+{
+    PSOutput OUT;
+
+    float2 uv         = IN.m_texCoord;
+    float4 sceneColor = PassSrg::m_inputColor.Sample(PassSrg::m_sampler, uv);
+    float  depth      = PassSrg::m_inputDepth.Sample(PassSrg::m_sampler, uv).r;
+    float3 result     = sceneColor.rgb;
+
+    float farZ = ViewSrg::GetFarZ();
+    if (farZ < 1.0f) farZ = 1000.0f;
+    bool isSky = (depth >= farZ * 0.999f);
+
+    if (PassSrg::m_enableFog != 0)
+    {
+        float marchDist = isSky ? PassSrg::m_fogEndDistance : depth;
+        float marchEnd  = min(marchDist, PassSrg::m_fogEndDistance);
+        float3 rayDir   = GetRayDir(uv);
+
+        FogResult fog = MarchFog(uv, IN.m_position.xy, rayDir, marchEnd);
+        result = result * fog.transmittance + fog.scattered;
+
+#if VF_DEBUG_LIGHT_COUNT
+        // Overlay: visualize how many local lights the iterator collected.
+        // Red = 0 (lights not reaching this tile/depth bin).
+        // Green = MAX_LIGHTS_PER_TYPE or more lights collected.
+        float lightFrac = saturate(float(fog.totalLights) / float(MAX_LIGHTS_PER_TYPE));
+        result = lerp(float3(0.6f, 0.0f, 0.0f), float3(0.0f, 0.8f, 0.2f), lightFrac);
+        if (fog.totalLights == 0) result = float3(0.8f, 0.0f, 0.0f);
+#endif
+    }
+
+    OUT.m_color = float4(result, sceneColor.a);
+    return OUT;
+}
